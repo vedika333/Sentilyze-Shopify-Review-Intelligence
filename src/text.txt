@@ -1,0 +1,265 @@
+import { Actor } from 'apify';
+import { CheerioCrawler, RequestQueue } from 'crawlee';
+import { load } from 'cheerio';
+import { gotScraping } from 'got-scraping';
+import Sentiment from 'sentiment';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
+
+export const entry = async () => {
+
+    await Actor.init();
+
+    const sentiment = new Sentiment();
+    let input = await Actor.getInput();
+
+    // Fallback to reading INPUT.json locally if input is null
+    if (!input) {
+        try {
+            const inputPath = resolve(process.cwd(), 'storage/key_value_stores/default/INPUT.json');
+            const data = readFileSync(inputPath, 'utf-8');
+            input = JSON.parse(data);
+            console.log('Loaded input from INPUT.json');
+        } catch (err) {
+            console.log('Could not load INPUT.json:', err.message);
+        }
+    }
+
+    const {
+        startUrls = [],
+        minRating = 3,
+        maxConcurrency = 20,
+        maxRequestsPerCrawl = 500,
+        maxRequestRetries = 3,
+        proxyConfiguration: proxyConfig,
+    } = input || {};
+
+    if (!startUrls.length) {
+        throw new Error('startUrls is required.');
+    }
+
+    const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
+    const requestQueue = await RequestQueue.open();
+
+    // Add category URLs
+    for (const { url } of startUrls) {
+        await requestQueue.addRequest({
+            url,
+            userData: { label: 'CATEGORY' },
+        });
+    }
+
+    const crawler = new CheerioCrawler({
+        requestQueue,
+        proxyConfiguration,
+        maxConcurrency,
+        maxRequestsPerCrawl,
+        maxRequestRetries,
+        useSessionPool: true,
+
+        async requestHandler({ request, $,body, enqueueLinks, log }) {
+
+            // -----------------------------
+            // CATEGORY PAGE
+            // -----------------------------
+            if (request.userData.label === 'CATEGORY') {
+
+                await enqueueLinks({
+                    selector: 'a[href*="/products/"]',
+                    transformRequestFunction: (req) => {
+                        req.url = req.url
+                            .replace(/\/collections\/[^/]+/, '')
+                            .split('?')[0] + '.json';
+                        req.userData = { label: 'PRODUCT' };
+                        return req;
+                    },
+                });
+
+                return;
+            }
+
+            // -----------------------------
+            // PRODUCT JSON
+            // -----------------------------
+            if (request.userData.label === 'PRODUCT') {
+                let product;
+
+                try {
+                    const json = JSON.parse(body);
+                    product = json.product ?? json;
+                } catch (err) {
+                    log.warning(`Invalid JSON for ${request.url}`);
+                    return;
+                }
+
+                if (!product?.title) return;
+
+                const productUrl = request.url.replace('.json', '');
+
+                let htmlResponse;
+
+                try {
+                    htmlResponse = await gotScraping({
+                        url: productUrl,
+                        proxyUrl: proxyConfiguration?.newUrl(),
+                    });
+                } catch (err) {
+                    log.warning(`Failed fetching HTML for ${productUrl}`);
+                    return;
+                }
+
+                const $$ = load(htmlResponse.body);
+
+                // Extract Rating
+                let rating = 0;
+
+                const ratingSelectors = [
+                    '.jdgm-prev-badge__stars',
+                    '.spr-starrating',
+                    '.loox-rating',
+                    '.stamped-badge'
+                ];
+
+                for (const selector of ratingSelectors) {
+                    const ratingAttr = $$(selector).attr('data-score')
+                        || $$(selector).attr('data-rating');
+
+                    if (ratingAttr) {
+                        rating = parseFloat(ratingAttr);
+                        break;
+                    }
+                }
+
+                if (rating >= minRating) return;
+
+                // Extract Reviews
+                const reviewSelectors = [
+                    '.jdgm-review',
+                    '.spr-review',
+                    '.loox-review',
+                    '.stamped-review',
+                    '.review'
+                ];
+
+                const reviews = [];
+
+                for (const selector of reviewSelectors) {
+                    $$(selector).each((i, el) => {
+                        const text = $$(el).text().trim().slice(0, 1000);
+                        if (text) reviews.push(text);
+                    });
+                }
+
+                if (!reviews.length) return;
+
+                // Sentiment Analysis
+                let totalScore = 0;
+                const negativeKeywords = [];
+
+                for (const review of reviews) {
+                    const result = sentiment.analyze(review);
+                    totalScore += result.score;
+
+                    if (result.score < 0) {
+                        negativeKeywords.push(...result.negative);
+                    }
+                }
+
+                const avgScore = totalScore / reviews.length;
+
+                await Actor.pushData({
+                    product_title: product.title,
+                    product_url: productUrl,
+                    rating,
+                    review_count: reviews.length,
+                    sentiment_score: avgScore,
+                    negative_keywords: [...new Set(negativeKeywords)],
+                    vendor: product.vendor,
+                    scraped_at: new Date(),
+                });
+
+                log.info(`Saved low-rated product: ${product.title}`);
+            }
+        },
+
+        failedRequestHandler({ request, log }) {
+            log.error(`Request failed: ${request.url}`);
+        },
+    });
+
+    await crawler.run();
+    await Actor.exit();
+};
+import Sentiment from 'sentiment';
+
+const sentiment = new Sentiment();
+
+export function analyzeReviews($$, minRating) {
+
+    // Rating extraction
+    let rating = 0;
+
+    const ratingSelectors = [
+        '.jdgm-prev-badge__stars',
+        '.spr-starrating',
+        '.loox-rating',
+        '.stamped-badge'
+    ];
+
+    for (const selector of ratingSelectors) {
+        const ratingAttr =
+            $$(selector).attr('data-score') ||
+            $$(selector).attr('data-rating');
+
+        if (ratingAttr) {
+            rating = parseFloat(ratingAttr);
+            break;
+        }
+    }
+
+    // Reviews extraction
+    const reviewSelectors = [
+        '.jdgm-review',
+        '.spr-review',
+        '.loox-review',
+        '.stamped-review',
+        '.review'
+    ];
+
+    const reviews = [];
+
+    for (const selector of reviewSelectors) {
+        $$(selector).each((i, el) => {
+            const text = $$(el).text().trim().slice(0, 1000);
+            if (text) reviews.push(text);
+        });
+    }
+
+    // Sentiment calculation
+    let totalScore = 0;
+    const negativeKeywords = [];
+
+    for (const review of reviews) {
+        const result = sentiment.analyze(review);
+        totalScore += result.score;
+
+        if (result.score < 0) {
+            negativeKeywords.push(...result.negative);
+        }
+    }
+
+    const sentimentScore = reviews.length
+        ? totalScore / reviews.length
+        : 0;
+
+    return {
+        rating,
+        reviews,
+        sentimentScore,
+        negativeKeywords: [...new Set(negativeKeywords)],
+    };
+}
+import {Actor} from 'apify';
+import { entry } from './index.js';
+
+await entry();

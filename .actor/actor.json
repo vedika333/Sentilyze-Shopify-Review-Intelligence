@@ -1,0 +1,39 @@
+{
+  "actorSpecification": 1,
+  "name": "judgeme-reviews-scraper",
+  "title": "Judge.me Reviews Scraper",
+  "description": "Scrape product reviews and star ratings from any Shopify store powered by Judge.me",
+  "version": "1.0",
+  "buildTag": "latest",
+  "environmentVariables": {},
+  "dockerfile": "./Dockerfile",
+  "readme": "./README.md",
+  "input": "./input_schema.json",
+  "storages": {
+    "dataset": {
+      "actorSpecification": 1,
+      "title": "Judge.me Reviews",
+      "views": {
+        "overview": {
+          "title": "Reviews Overview",
+          "transformation": {
+            "fields": [
+              "productUrl",
+              "productId",
+              "storeDomain",
+              "totalReviews",
+              "averageRating",
+              "reviewerName",
+              "rating",
+              "headline",
+              "body",
+              "date",
+              "verified",
+              "scrapedAt"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
